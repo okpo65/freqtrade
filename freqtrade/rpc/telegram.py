@@ -18,6 +18,8 @@ from itertools import chain
 from math import isnan
 from threading import Thread
 from typing import Any, Literal
+from collections import deque
+from typing import Deque, Tuple
 
 from tabulate import tabulate
 from telegram import (
@@ -149,9 +151,10 @@ class Telegram(RPCHandler):
         :return: None
         """
         super().__init__(rpc, config)
-
+        self._pending: Deque[Tuple[str, bool]] = deque()
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._app: Application
-        self._loop: asyncio.AbstractEventLoop
+        # self._loop: asyncio.AbstractEventLoop
         self._init_keyboard()
         self._start_thread()
 
@@ -159,7 +162,7 @@ class Telegram(RPCHandler):
         """
         Creates and starts the polling thread
         """
-        self._thread = Thread(target=self._init, name="FTTelegram")
+        self._thread = Thread(target=self._init, name="FTTelegram", daemon=True)
         self._thread.start()
 
     def _init_keyboard(self) -> None:
@@ -244,102 +247,123 @@ class Telegram(RPCHandler):
                 logger.info(f"using custom keyboard from config.json: {self._keyboard}")
 
     def _init_telegram_app(self):
-        return Application.builder().token(self._config["telegram"]["token"]).build()
+        return Application.builder().token(self._config["telegram"]["token"]).post_init(self._post_init).build()
 
     def _init(self) -> None:
         """
-        Initializes this module with the given config,
-        registers all known command handlers
-        and starts polling for message updates
-        Runs in a separate thread.
+        Initializes the app, registers handlers, and runs polling.
+        Runs in a separate thread and blocks that thread (which is fine).
         """
         try:
-            self._loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
+            self._app = self._init_telegram_app()
 
-        self._app = self._init_telegram_app()
+            # Register handlers
+            handles = [
+                CommandHandler("status", self._status),
+                CommandHandler("profit", self._profit),
+                CommandHandler("balance", self._balance),
+                CommandHandler("start", self._start),
+                CommandHandler("stop", self._stop),
+                CommandHandler(["forcesell", "forceexit", "fx"], self._force_exit),
+                CommandHandler(["forcebuy", "forcelong"], partial(self._force_enter, order_side=SignalDirection.LONG)),
+                CommandHandler("forceshort", partial(self._force_enter, order_side=SignalDirection.SHORT)),
+                CommandHandler("reload_trade", self._reload_trade_from_exchange),
+                CommandHandler("trades", self._trades),
+                CommandHandler("delete", self._delete_trade),
+                CommandHandler(["coo", "cancel_open_order"], self._cancel_open_order),
+                CommandHandler("performance", self._performance),
+                CommandHandler(["buys", "entries"], self._enter_tag_performance),
+                CommandHandler(["sells", "exits"], self._exit_reason_performance),
+                CommandHandler("mix_tags", self._mix_tag_performance),
+                CommandHandler("stats", self._stats),
+                CommandHandler("daily", self._daily),
+                CommandHandler("weekly", self._weekly),
+                CommandHandler("monthly", self._monthly),
+                CommandHandler("count", self._count),
+                CommandHandler("locks", self._locks),
+                CommandHandler(["unlock", "delete_locks"], self._delete_locks),
+                CommandHandler(["reload_config", "reload_conf"], self._reload_config),
+                CommandHandler(["show_config", "show_conf"], self._show_config),
+                CommandHandler(["stopbuy", "stopentry", "pause"], self._pause),
+                CommandHandler("whitelist", self._whitelist),
+                CommandHandler("blacklist", self._blacklist),
+                CommandHandler(["blacklist_delete", "bl_delete"], self._blacklist_delete),
+                CommandHandler("logs", self._logs),
+                CommandHandler("health", self._health),
+                CommandHandler("help", self._help),
+                CommandHandler("version", self._version),
+                CommandHandler("marketdir", self._changemarketdir),
+                CommandHandler("order", self._order),
+                CommandHandler("list_custom_data", self._list_custom_data),
+                CommandHandler("tg_info", self._tg_info),
+                CommandHandler("profit_long", self._profit_long),
+                CommandHandler("profit_short", self._profit_short),
+            ]
+            callbacks = [
+                CallbackQueryHandler(self._status_table, pattern="update_status_table"),
+                CallbackQueryHandler(self._daily, pattern="update_daily"),
+                CallbackQueryHandler(self._weekly, pattern="update_weekly"),
+                CallbackQueryHandler(self._monthly, pattern="update_monthly"),
+                CallbackQueryHandler(self._profit_long, pattern="update_profit_long"),
+                CallbackQueryHandler(self._profit_short, pattern="update_profit_short"),
+                CallbackQueryHandler(self._profit, pattern=r"update_profit$"),
+                CallbackQueryHandler(self._balance, pattern="update_balance"),
+                CallbackQueryHandler(self._performance, pattern="update_performance"),
+                CallbackQueryHandler(self._enter_tag_performance, pattern="update_enter_tag_performance"),
+                CallbackQueryHandler(self._exit_reason_performance, pattern="update_exit_reason_performance"),
+                CallbackQueryHandler(self._mix_tag_performance, pattern="update_mix_tag_performance"),
+                CallbackQueryHandler(self._count, pattern="update_count"),
+                CallbackQueryHandler(self._force_exit_inline, pattern=r"force_exit__\S+"),
+                CallbackQueryHandler(self._force_enter_inline, pattern=r"force_enter__\S+"),
+            ]
 
-        # Register command handler and start telegram message polling
-        handles = [
-            CommandHandler("status", self._status),
-            CommandHandler("profit", self._profit),
-            CommandHandler("balance", self._balance),
-            CommandHandler("start", self._start),
-            CommandHandler("stop", self._stop),
-            CommandHandler(["forcesell", "forceexit", "fx"], self._force_exit),
-            CommandHandler(
-                ["forcebuy", "forcelong"],
-                partial(self._force_enter, order_side=SignalDirection.LONG),
-            ),
-            CommandHandler(
-                "forceshort", partial(self._force_enter, order_side=SignalDirection.SHORT)
-            ),
-            CommandHandler("reload_trade", self._reload_trade_from_exchange),
-            CommandHandler("trades", self._trades),
-            CommandHandler("delete", self._delete_trade),
-            CommandHandler(["coo", "cancel_open_order"], self._cancel_open_order),
-            CommandHandler("performance", self._performance),
-            CommandHandler(["buys", "entries"], self._enter_tag_performance),
-            CommandHandler(["sells", "exits"], self._exit_reason_performance),
-            CommandHandler("mix_tags", self._mix_tag_performance),
-            CommandHandler("stats", self._stats),
-            CommandHandler("daily", self._daily),
-            CommandHandler("weekly", self._weekly),
-            CommandHandler("monthly", self._monthly),
-            CommandHandler("count", self._count),
-            CommandHandler("locks", self._locks),
-            CommandHandler(["unlock", "delete_locks"], self._delete_locks),
-            CommandHandler(["reload_config", "reload_conf"], self._reload_config),
-            CommandHandler(["show_config", "show_conf"], self._show_config),
-            CommandHandler(["stopbuy", "stopentry", "pause"], self._pause),
-            CommandHandler("whitelist", self._whitelist),
-            CommandHandler("blacklist", self._blacklist),
-            CommandHandler(["blacklist_delete", "bl_delete"], self._blacklist_delete),
-            CommandHandler("logs", self._logs),
-            CommandHandler("health", self._health),
-            CommandHandler("help", self._help),
-            CommandHandler("version", self._version),
-            CommandHandler("marketdir", self._changemarketdir),
-            CommandHandler("order", self._order),
-            CommandHandler("list_custom_data", self._list_custom_data),
-            CommandHandler("tg_info", self._tg_info),
-            CommandHandler("profit_long", self._profit_long),
-            CommandHandler("profit_short", self._profit_short),
-        ]
-        callbacks = [
-            CallbackQueryHandler(self._status_table, pattern="update_status_table"),
-            CallbackQueryHandler(self._daily, pattern="update_daily"),
-            CallbackQueryHandler(self._weekly, pattern="update_weekly"),
-            CallbackQueryHandler(self._monthly, pattern="update_monthly"),
-            CallbackQueryHandler(self._profit_long, pattern="update_profit_long"),
-            CallbackQueryHandler(self._profit_short, pattern="update_profit_short"),
-            CallbackQueryHandler(self._profit, pattern=r"update_profit$"),
-            CallbackQueryHandler(self._balance, pattern="update_balance"),
-            CallbackQueryHandler(self._performance, pattern="update_performance"),
-            CallbackQueryHandler(
-                self._enter_tag_performance, pattern="update_enter_tag_performance"
-            ),
-            CallbackQueryHandler(
-                self._exit_reason_performance, pattern="update_exit_reason_performance"
-            ),
-            CallbackQueryHandler(self._mix_tag_performance, pattern="update_mix_tag_performance"),
-            CallbackQueryHandler(self._count, pattern="update_count"),
-            CallbackQueryHandler(self._force_exit_inline, pattern=r"force_exit__\S+"),
-            CallbackQueryHandler(self._force_enter_inline, pattern=r"force_enter__\S+"),
-        ]
-        for handle in handles:
-            self._app.add_handler(handle)
+            for h in handles:
+                self._app.add_handler(h)
+            for cb in callbacks:
+                self._app.add_handler(cb)
 
-        for callback in callbacks:
-            self._app.add_handler(callback)
+            logger.info(
+                "rpc.telegram is listening for commands: %s",
+                [[x for x in sorted(h.commands)] for h in handles],
+            )
 
-        logger.info(
-            "rpc.telegram is listening for following commands: %s",
-            [[x for x in sorted(h.commands)] for h in handles],
-        )
-        self._loop.run_until_complete(self._startup_telegram())
+            self._thread.name = "FTTelegram"
+            self._app.run_polling(
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES,
+                close_loop=False,
+                stop_signals=[],
+            )
+
+        except Exception:
+            logger.exception("Exception occurred starting Telegram polling thread")
+
+    async def _delete_webhook_safe(self, app: Application) -> None:
+        try:
+            await app.bot.delete_webhook(drop_pending_updates=True)
+        except Exception as ex:
+            logger.warning("delete_webhook failed (continuing): %s", ex)
+
+    async def _post_init(self, app: Application):
+        # capture PTB's running loop
+        self._loop = asyncio.get_running_loop()
+
+        # clear webhook on the SAME loop PTB uses
+        try:
+            await app.bot.delete_webhook(drop_pending_updates=True)
+        except Exception as ex:
+            logger.warning("delete_webhook failed (continuing): %s", ex)
+
+        # flush any messages queued before the loop was running
+        while self._pending:
+            text, silent = self._pending.popleft()
+            try:
+                await self._send_msg(text, disable_notification=silent)
+            except Exception:
+                logger.exception("Failed to flush pending Telegram message")
+
+
+
 
     async def _startup_telegram(self) -> None:
         retries = 3
@@ -372,19 +396,44 @@ class Telegram(RPCHandler):
                     break
 
     async def _cleanup_telegram(self) -> None:
-        if self._app.updater:
-            await self._app.updater.stop()
-        await self._app.stop()
-        await self._app.shutdown()
+        try:
+            await self._app.stop()
+        except Exception:
+            # app may already be stopping/stopped
+            logger.debug("App.stop() raised during cleanup", exc_info=True)
+        try:
+            await self._app.shutdown()
+        except Exception:
+            logger.debug("App.shutdown() raised during cleanup", exc_info=True)
 
     def cleanup(self) -> None:
         """
-        Stops all running telegram threads.
-        :return: None
+        Stops the polling thread and shuts down the Application cleanly.
+        Safe to call from any thread.
         """
-        # This can take up to `timeout` from the call to `start_polling`.
-        asyncio.run_coroutine_threadsafe(self._cleanup_telegram(), self._loop)
-        self._thread.join()
+        try:
+            if self._loop and self._loop.is_running():
+                # schedule on PTB's loop
+                fut = asyncio.run_coroutine_threadsafe(self._cleanup_telegram(), self._loop)
+                # optional: wait briefly for a graceful shutdown
+                try:
+                    fut.result(timeout=5)
+                except Exception:
+                    logger.debug("Graceful cleanup timed out/failed", exc_info=True)
+            else:
+                # No PTB loop running (or never started) -> run cleanup synchronously
+                try:
+                    asyncio.run(self._cleanup_telegram())
+                except RuntimeError:
+                    # Fallback: drive a fresh event loop in this thread
+                    loop = asyncio.new_event_loop()
+                    try:
+                        loop.run_until_complete(self._cleanup_telegram())
+                    finally:
+                        loop.close()
+        finally:
+            if hasattr(self, "_thread"):
+                self._thread.join(timeout=5)
 
     def _exchange_from_msg(self, msg: RPCOrderMsg) -> str:
         """
@@ -615,19 +664,32 @@ class Telegram(RPCHandler):
         return noti
 
     def send_msg(self, msg: RPCSendMsg) -> None:
-        """Send a message to telegram channel"""
         noti = self._message_loudness(msg)
-
         if noti == "off":
-            logger.info(f"Notification '{msg['type']}' not sent.")
-            # Notification disabled
+            logger.info("Notification '%s' not sent.", msg["type"])
             return
 
         message = self.compose_message(deepcopy(msg))
-        if message:
+        if not message:
+            return
+
+        silent = (noti == "silent")
+
+        # If PTB loop not ready/running, buffer
+        if not self._loop or self._loop.is_closed() or not self._loop.is_running():
+            logger.debug("PTB loop not running; buffering message.")
+            self._pending.append((message, silent))
+            return
+
+        # Schedule safely onto PTB's loop from this (foreign) thread
+        try:
             asyncio.run_coroutine_threadsafe(
-                self._send_msg(message, disable_notification=(noti == "silent")), self._loop
+                self._send_msg(message, disable_notification=silent),
+                self._loop,
             )
+        except Exception:
+            logger.exception("Failed to schedule Telegram send; buffering.")
+            self._pending.append((message, silent))
 
     def _get_exit_emoji(self, msg):
         """
